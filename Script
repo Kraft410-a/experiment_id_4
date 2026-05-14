@@ -1,0 +1,729 @@
+# -*- coding: utf-8 -*-
+r"""
+Обработка experiment_id_6 для эксперимента ФОТЕК.
+
+Что делает скрипт:
+1) читает CSV-файлы осциллографа RTB2004_CHAN1(i).CSV, RTB2004_CHAN2(i).CSV, RTB2004_CHAN3(i).CSV;
+2) считает фазовый сдвиг между CH2 и CH1 методом Гильберта;
+3) перед расчетом фазы фильтрует CH1 и CH2 полосовым фильтром Баттерворта вокруг основной частоты;
+4) считает признаки канала CH3: RMS AC-составляющей и амплитуду на основной частоте;
+5) считает Pearson/Spearman корреляции;
+6) строит графики с оформлением Times New Roman 14 pt;
+7) сохраняет таблицы XLSX/CSV, графики PNG и текстовый summary.
+
+Таблица температур для experiment_id_6:
+file_id: 0..15
+time_s: 0..150 с
+temp_C: 30, 49, 52, 70, 78, 85, 85, 91, 94, 97, 99, 100, 100, 100, 101, 102
+
+Запуск:
+    python analyze_fotek_experiment_id_6_FINAL_times14.py
+
+Если запускаете в Jupyter и notebook лежит не в папке с CSV,
+замените DATA_DIR = Path.cwd() на явный путь, например:
+    DATA_DIR = Path(r"C:\Users\User\Desktop\FOTEK_ALL_EXPERIMENTS\experiment_id_6")
+"""
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.signal import butter, sosfiltfilt, hilbert
+from scipy.stats import pearsonr, spearmanr, linregress
+
+
+# ============================================================
+# 1. НАСТРОЙКИ
+# ============================================================
+
+EXPERIMENT_ID = 6
+
+# Если скрипт лежит в той же папке, что и CSV, оставьте так:
+DATA_DIR = Path.cwd()
+
+# Если CSV лежат в другой папке, закомментируйте строку выше и укажите путь:
+# DATA_DIR = Path(r"C:\Users\User\Desktop\FOTEK_ALL_EXPERIMENTS\experiment_id_6")
+
+OUT_DIR = DATA_DIR / "results_experiment_id_6_FINAL_times_new_roman_14"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Таблица температур experiment_id_6
+# file_id = 0..15, time_s = 0..150 с
+MEASUREMENTS = pd.DataFrame({
+    "experiment_id": [EXPERIMENT_ID] * 16,
+    "file_id": list(range(16)),
+    "time_s": [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150],
+    "temp_C": [30, 49, 52, 70, 78, 85, 85, 91, 94, 97, 99, 100, 100, 100, 101, 102],
+})
+
+# Каналы осциллографа
+CH_VOLTAGE = 1   # исходный сигнал / напряжение с ФОТЕК
+CH_BIO = 2       # сигнал после прохождения через биообъект
+CH_THERMO = 3    # сигнал с термопары на осциллографе
+
+# Полоса фильтрации относительно основной частоты f0
+BAND_LOW_MULT = 0.5
+BAND_HIGH_MULT = 1.5
+
+# Параметры проверки качества
+MIN_PHASE_QUALITY_R = 0.95
+MAX_F0_RELATIVE_DEVIATION = 0.15  # 15% от медианной f0
+
+
+# ============================================================
+# 2. ОФОРМЛЕНИЕ ГРАФИКОВ: TIMES NEW ROMAN 14
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 14,
+    "axes.titlesize": 14,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
+    "legend.fontsize": 14,
+    "figure.titlesize": 14,
+    "mathtext.fontset": "stix",
+    "axes.unicode_minus": False,
+})
+
+
+# ============================================================
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def read_channel(data_dir: Path, ch: int, file_id: int):
+    """
+    Читает CSV-файл канала осциллографа.
+    Ожидается, что в CSV первый столбец — время, второй — сигнал.
+    Если в файле есть служебные строки, pandas обычно сам обработает заголовок.
+    """
+    path = data_dir / f"RTB2004_CHAN{ch}({file_id}).CSV"
+    if not path.exists():
+        raise FileNotFoundError(f"Не найден файл: {path}")
+
+    # Пробуем обычное чтение
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        # Если CSV нестандартный, пробуем с разделителем ;
+        df = pd.read_csv(path, sep=";")
+
+    if df.shape[1] < 2:
+        raise ValueError(f"В файле {path.name} меньше двух столбцов")
+
+    # Берем первые два числовых столбца.
+    # Это защищает от лишних текстовых колонок.
+    numeric_df = df.apply(pd.to_numeric, errors="coerce")
+    numeric_df = numeric_df.dropna(axis=1, how="all")
+
+    if numeric_df.shape[1] < 2:
+        raise ValueError(f"В файле {path.name} не удалось найти два числовых столбца")
+
+    t = numeric_df.iloc[:, 0].to_numpy(dtype=float)
+    y = numeric_df.iloc[:, 1].to_numpy(dtype=float)
+
+    # Удаляем строки с NaN
+    mask = np.isfinite(t) & np.isfinite(y)
+    t = t[mask]
+    y = y[mask]
+
+    if len(t) < 10:
+        raise ValueError(f"В файле {path.name} слишком мало точек после очистки")
+
+    return t, y
+
+
+def estimate_fs(t):
+    """Оценивает частоту дискретизации по временной оси."""
+    dt = np.median(np.diff(t))
+    if dt <= 0:
+        raise ValueError("Временная ось должна монотонно возрастать")
+    return 1.0 / dt
+
+
+def dominant_frequency(t, y, fmin=1e5, fmax=5e6):
+    """
+    Ищет основную частоту сигнала по FFT в диапазоне fmin..fmax.
+    Для экспериментов ФОТЕК обычно получается около 450 кГц.
+    """
+    fs = estimate_fs(t)
+    x = y - np.mean(y)
+
+    win = np.hanning(len(x))
+    freqs = np.fft.rfftfreq(len(x), d=1 / fs)
+    spec = np.abs(np.fft.rfft(x * win))
+
+    mask = (freqs >= fmin) & (freqs <= fmax)
+    if not np.any(mask):
+        raise ValueError("Не найдена частотная область для поиска основной частоты")
+
+    return freqs[mask][np.argmax(spec[mask])]
+
+
+def bandpass_zero_phase(y, fs, low_hz, high_hz, order=4):
+    """
+    Полосовой фильтр Баттерворта + прямой-обратный проход.
+    Прямой-обратный проход нужен, чтобы фильтр не вносил фазовый сдвиг.
+    """
+    low_hz = max(float(low_hz), 1.0)
+    high_hz = min(float(high_hz), 0.45 * fs)
+
+    if low_hz >= high_hz:
+        raise ValueError(f"Некорректная полоса фильтра: low={low_hz}, high={high_hz}, fs={fs}")
+
+    sos = butter(
+        order,
+        [low_hz, high_hz],
+        btype="bandpass",
+        fs=fs,
+        output="sos"
+    )
+
+    return sosfiltfilt(sos, y - np.mean(y))
+
+
+def circular_mean_rad(angles_rad):
+    """Среднее значение углов в радианах."""
+    return np.angle(np.mean(np.exp(1j * angles_rad)))
+
+
+def fft_component_amp(t, y, f0):
+    """
+    Амплитуда компоненты сигнала y на частоте f0.
+    Нужна для оценки ВЧ-составляющей на канале CH3.
+    """
+    fs = estimate_fs(t)
+    x = y - np.mean(y)
+
+    win = np.hanning(len(x))
+    freqs = np.fft.rfftfreq(len(x), d=1 / fs)
+    spec = np.fft.rfft(x * win)
+
+    idx = np.argmin(np.abs(freqs - f0))
+
+    # Приближенная амплитуда синусоидальной компоненты
+    amp = 2 * np.abs(spec[idx]) / np.sum(win)
+    return amp
+
+
+def phase_shift_hilbert(t, x_voltage, y_bio, f0):
+    """
+    Расчет фазового сдвига методом Гильберта.
+
+    phase_shift = phase_CH2 - phase_CH1
+
+    Возвращает:
+    - средний фазовый сдвиг в радианах;
+    - показатель качества R.
+    """
+    fs = estimate_fs(t)
+
+    low = BAND_LOW_MULT * f0
+    high = BAND_HIGH_MULT * f0
+
+    x_f = bandpass_zero_phase(x_voltage, fs, low, high)
+    y_f = bandpass_zero_phase(y_bio, fs, low, high)
+
+    ax = hilbert(x_f)
+    ay = hilbert(y_f)
+
+    phase_x = np.angle(ax)
+    phase_y = np.angle(ay)
+
+    n = len(t)
+    edge = int(0.10 * n)
+
+    env_x = np.abs(ax)
+    env_y = np.abs(ay)
+
+    mask = np.ones(n, dtype=bool)
+
+    # Убираем края записи, где возможны переходные эффекты фильтра/Гильберта
+    if edge > 0:
+        mask[:edge] = False
+        mask[-edge:] = False
+
+    # Убираем участки с малой амплитудой, где фаза плохо определена
+    mask &= env_x > np.quantile(env_x, 0.20)
+    mask &= env_y > np.quantile(env_y, 0.20)
+
+    if np.sum(mask) < 10:
+        raise ValueError("Слишком мало точек для надежного расчета фазы")
+
+    dphi = np.angle(np.exp(1j * (phase_y[mask] - phase_x[mask])))
+
+    mean_phi = circular_mean_rad(dphi)
+
+    # R близко к 1 — фазовый сдвиг стабилен
+    # R близко к 0 — фазовый сдвиг сильно разбросан
+    phase_quality_R = np.abs(np.mean(np.exp(1j * dphi)))
+
+    return mean_phi, phase_quality_R
+
+
+def analyze_one(file_id):
+    """Обработка одного номера файла."""
+    t1, voltage = read_channel(DATA_DIR, CH_VOLTAGE, file_id)
+    t2, bio = read_channel(DATA_DIR, CH_BIO, file_id)
+    t3, thermo = read_channel(DATA_DIR, CH_THERMO, file_id)
+
+    # Интерполируем каналы на временную ось CH1, если оси слегка отличаются
+    if len(t2) != len(t1) or not np.allclose(t1, t2, rtol=0, atol=np.median(np.diff(t1)) * 0.1):
+        bio = np.interp(t1, t2, bio)
+
+    if len(t3) != len(t1) or not np.allclose(t1, t3, rtol=0, atol=np.median(np.diff(t1)) * 0.1):
+        thermo = np.interp(t1, t3, thermo)
+
+    fs = estimate_fs(t1)
+    f0 = dominant_frequency(t1, voltage)
+
+    phi_rad, phase_quality_R = phase_shift_hilbert(t1, voltage, bio, f0)
+
+    return {
+        "experiment_id": EXPERIMENT_ID,
+        "file_id": file_id,
+        "fs_Hz": fs,
+        "f0_Hz": f0,
+
+        "phase_rad": phi_rad,
+        "phase_deg": np.degrees(phi_rad),
+        "phase_quality_R": phase_quality_R,
+
+        "voltage_mean_V": np.mean(voltage),
+        "voltage_rms_ac_V": np.std(voltage - np.mean(voltage)),
+        "bio_mean_V": np.mean(bio),
+        "bio_rms_ac_V": np.std(bio - np.mean(bio)),
+
+        "thermo_mean_V": np.mean(thermo),
+        "thermo_median_V": np.median(thermo),
+        "thermo_rms_ac_V": np.std(thermo - np.mean(thermo)),
+        "thermo_amp_at_f0_V": fft_component_amp(t1, thermo, f0),
+    }
+
+
+def safe_corr(x, y):
+    """Безопасный расчет Pearson и Spearman."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 3 or np.std(x) == 0 or np.std(y) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    pr = pearsonr(x, y)
+    sr = spearmanr(x, y)
+
+    return pr.statistic, pr.pvalue, sr.statistic, sr.pvalue
+
+
+def save_fig(fig, filename):
+    fig.savefig(OUT_DIR / filename, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def style_axes(ax):
+    ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.7)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+
+
+def scatter_with_fit(x, y, xlabel, ylabel, filename, annotate_file_ids=True, file_ids=None):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(x, y, s=45)
+
+    if len(x) >= 3 and np.std(x) > 0:
+        lr = linregress(x, y)
+        xx = np.linspace(np.min(x), np.max(x), 200)
+        yy = lr.slope * xx + lr.intercept
+        ax.plot(
+            xx,
+            yy,
+            linewidth=2,
+            label=f"T = {lr.slope:.3f}·φ + {lr.intercept:.3f}\nR² = {lr.rvalue**2:.3f}"
+        )
+        ax.legend(frameon=True)
+
+    if annotate_file_ids and file_ids is not None:
+        for xi, yi, fid in zip(x, y, file_ids):
+            ax.annotate(str(fid), (xi, yi), textcoords="offset points", xytext=(5, 5))
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, filename)
+
+
+# ============================================================
+# 4. ОСНОВНАЯ ОБРАБОТКА
+# ============================================================
+
+def main():
+    print("=" * 70)
+    print(f"Обработка experiment_id_{EXPERIMENT_ID}")
+    print("=" * 70)
+    print(f"Папка с CSV: {DATA_DIR}")
+    print(f"Папка результатов: {OUT_DIR}")
+
+    expected_files = []
+    for file_id in MEASUREMENTS["file_id"]:
+        for ch in [CH_VOLTAGE, CH_BIO, CH_THERMO]:
+            expected_files.append(DATA_DIR / f"RTB2004_CHAN{ch}({int(file_id)}).CSV")
+
+    missing = [p.name for p in expected_files if not p.exists()]
+    if missing:
+        print("\nВНИМАНИЕ: не найдены некоторые CSV-файлы:")
+        for name in missing[:30]:
+            print("  ", name)
+        if len(missing) > 30:
+            print(f"  ... и еще {len(missing) - 30}")
+        print("\nСкрипт обработает только те file_id, для которых есть все 3 канала.\n")
+
+    rows = []
+    errors = []
+
+    for file_id in MEASUREMENTS["file_id"]:
+        file_id = int(file_id)
+        try:
+            print(f"Обработка file_id={file_id} ...")
+            rows.append(analyze_one(file_id))
+        except Exception as e:
+            err = {"experiment_id": EXPERIMENT_ID, "file_id": file_id, "error": str(e)}
+            errors.append(err)
+            print(f"  ОШИБКА file_id={file_id}: {e}")
+
+    if not rows:
+        raise RuntimeError("Не удалось обработать ни одного файла. Проверьте путь DATA_DIR и названия CSV.")
+
+    result = pd.DataFrame(rows)
+    result = result.merge(MEASUREMENTS, on=["experiment_id", "file_id"], how="left")
+    result = result.sort_values("file_id").reset_index(drop=True)
+
+    # unwrap фазы
+    result["phase_unwrapped_deg"] = np.degrees(
+        np.unwrap(np.radians(result["phase_deg"].to_numpy()))
+    )
+
+    # --------------------------------------------------------
+    # Корреляции
+    # --------------------------------------------------------
+
+    features = [
+        "phase_unwrapped_deg",
+        "phase_deg",
+        "thermo_mean_V",
+        "thermo_median_V",
+        "thermo_rms_ac_V",
+        "thermo_amp_at_f0_V",
+        "voltage_rms_ac_V",
+        "bio_rms_ac_V",
+        "f0_Hz",
+    ]
+
+    corr_rows = []
+    for col in features:
+        pearson_r, pearson_p, spearman_rho, spearman_p = safe_corr(result[col], result["temp_C"])
+        corr_rows.append({
+            "experiment_id": EXPERIMENT_ID,
+            "feature": col,
+            "pearson_r": pearson_r,
+            "pearson_p": pearson_p,
+            "spearman_rho": spearman_rho,
+            "spearman_p": spearman_p,
+        })
+
+    correlations = pd.DataFrame(corr_rows)
+
+    # --------------------------------------------------------
+    # Линейная модель T = a*phase + b
+    # --------------------------------------------------------
+
+    if len(result) >= 3 and np.std(result["phase_unwrapped_deg"]) > 0:
+        lr = linregress(result["phase_unwrapped_deg"], result["temp_C"])
+        y_pred = lr.slope * result["phase_unwrapped_deg"] + lr.intercept
+        residuals = result["temp_C"] - y_pred
+        rmse = float(np.sqrt(np.mean(residuals**2)))
+        mae = float(np.mean(np.abs(residuals)))
+
+        result["temp_pred_from_phase_C"] = y_pred
+        result["residual_phase_model_C"] = residuals
+
+        model = pd.DataFrame([{
+            "experiment_id": EXPERIMENT_ID,
+            "model": "T = a * phase_unwrapped_deg + b",
+            "a_slope_C_per_deg": lr.slope,
+            "b_intercept_C": lr.intercept,
+            "r_value": lr.rvalue,
+            "r_squared": lr.rvalue ** 2,
+            "p_value": lr.pvalue,
+            "std_err": lr.stderr,
+            "rmse_C": rmse,
+            "mae_C": mae,
+            "n_points": len(result),
+        }])
+    else:
+        result["temp_pred_from_phase_C"] = np.nan
+        result["residual_phase_model_C"] = np.nan
+        model = pd.DataFrame([{
+            "experiment_id": EXPERIMENT_ID,
+            "model": "T = a * phase_unwrapped_deg + b",
+            "a_slope_C_per_deg": np.nan,
+            "b_intercept_C": np.nan,
+            "r_value": np.nan,
+            "r_squared": np.nan,
+            "p_value": np.nan,
+            "std_err": np.nan,
+            "rmse_C": np.nan,
+            "mae_C": np.nan,
+            "n_points": len(result),
+        }])
+
+    # --------------------------------------------------------
+    # Флаги качества
+    # --------------------------------------------------------
+
+    median_f0 = result["f0_Hz"].median()
+
+    quality_rows = []
+    for _, row in result.iterrows():
+        flags = []
+
+        if row["phase_quality_R"] < MIN_PHASE_QUALITY_R:
+            flags.append("LOW_PHASE_QUALITY")
+
+        if median_f0 > 0:
+            rel_dev = abs(row["f0_Hz"] - median_f0) / median_f0
+            if rel_dev > MAX_F0_RELATIVE_DEVIATION:
+                flags.append("F0_OUTLIER")
+
+        if row["voltage_rms_ac_V"] <= 0:
+            flags.append("CH1_ZERO_OR_BAD_RMS")
+
+        if row["bio_rms_ac_V"] <= 0:
+            flags.append("CH2_ZERO_OR_BAD_RMS")
+
+        if row["thermo_rms_ac_V"] <= 0:
+            flags.append("CH3_ZERO_OR_BAD_RMS")
+
+        quality_rows.append({
+            "experiment_id": EXPERIMENT_ID,
+            "file_id": int(row["file_id"]),
+            "phase_quality_R": row["phase_quality_R"],
+            "f0_Hz": row["f0_Hz"],
+            "voltage_rms_ac_V": row["voltage_rms_ac_V"],
+            "bio_rms_ac_V": row["bio_rms_ac_V"],
+            "thermo_rms_ac_V": row["thermo_rms_ac_V"],
+            "flags": "OK" if not flags else "; ".join(flags),
+        })
+
+    quality = pd.DataFrame(quality_rows)
+    errors_df = pd.DataFrame(errors)
+
+    # --------------------------------------------------------
+    # Сохранение таблиц
+    # --------------------------------------------------------
+
+    short_cols = [
+        "experiment_id",
+        "file_id",
+        "time_s",
+        "temp_C",
+        "f0_Hz",
+        "phase_deg",
+        "phase_unwrapped_deg",
+        "phase_quality_R",
+        "thermo_mean_V",
+        "thermo_median_V",
+        "thermo_rms_ac_V",
+        "thermo_amp_at_f0_V",
+        "temp_pred_from_phase_C",
+        "residual_phase_model_C",
+    ]
+
+    result_short = result[short_cols].copy()
+
+    result.to_csv(OUT_DIR / f"analysis_result_full_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+    result_short.to_csv(OUT_DIR / f"analysis_result_short_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+    correlations.to_csv(OUT_DIR / f"correlations_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+    model.to_csv(OUT_DIR / f"linear_model_phase_temperature_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+    quality.to_csv(OUT_DIR / f"quality_flags_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+    errors_df.to_csv(OUT_DIR / f"errors_experiment_id_{EXPERIMENT_ID}.csv", index=False, encoding="utf-8-sig")
+
+    # xlsx сохраняем, если установлен openpyxl
+    try:
+        result.to_excel(OUT_DIR / f"analysis_result_full_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+        result_short.to_excel(OUT_DIR / f"analysis_result_short_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+        correlations.to_excel(OUT_DIR / f"correlations_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+        model.to_excel(OUT_DIR / f"linear_model_phase_temperature_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+        quality.to_excel(OUT_DIR / f"quality_flags_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+        errors_df.to_excel(OUT_DIR / f"errors_experiment_id_{EXPERIMENT_ID}.xlsx", index=False)
+    except Exception as e:
+        warnings.warn(f"Не удалось сохранить XLSX. CSV сохранены. Причина: {e}")
+
+    # --------------------------------------------------------
+    # Графики
+    # --------------------------------------------------------
+
+    # 01 Температура от времени
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(result["time_s"], result["temp_C"], marker="o", linewidth=2)
+    ax.set_xlabel("Время, с")
+    ax.set_ylabel("Температура, °C")
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"01_temperature_vs_time_exp{EXPERIMENT_ID}.png")
+
+    # 02 Фаза от времени
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(result["time_s"], result["phase_unwrapped_deg"], marker="o", linewidth=2)
+    ax.set_xlabel("Время, с")
+    ax.set_ylabel("Фазовый сдвиг, градусы")
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"02_phase_vs_time_exp{EXPERIMENT_ID}.png")
+
+    # 03 Температура от фазы
+    scatter_with_fit(
+        result["phase_unwrapped_deg"].to_numpy(),
+        result["temp_C"].to_numpy(),
+        "Фазовый сдвиг φ, градусы",
+        "Температура, °C",
+        f"03_temperature_vs_phase_exp{EXPERIMENT_ID}.png",
+        annotate_file_ids=True,
+        file_ids=result["file_id"].to_numpy()
+    )
+
+    # 04 Температура от RMS CH3
+    scatter_with_fit(
+        result["thermo_rms_ac_V"].to_numpy(),
+        result["temp_C"].to_numpy(),
+        "СКЗ AC-составляющей CH3, В",
+        "Температура, °C",
+        f"04_temperature_vs_thermo_rms_exp{EXPERIMENT_ID}.png",
+        annotate_file_ids=True,
+        file_ids=result["file_id"].to_numpy()
+    )
+
+    # 05 Температура от амплитуды CH3 на f0
+    scatter_with_fit(
+        result["thermo_amp_at_f0_V"].to_numpy(),
+        result["temp_C"].to_numpy(),
+        "Амплитуда CH3 на основной частоте, В",
+        "Температура, °C",
+        f"05_temperature_vs_thermo_amp_at_f0_exp{EXPERIMENT_ID}.png",
+        annotate_file_ids=True,
+        file_ids=result["file_id"].to_numpy()
+    )
+
+    # 06 Качество фазового расчета
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(result["file_id"], result["phase_quality_R"], marker="o", linewidth=2)
+    ax.set_xlabel("Номер файла")
+    ax.set_ylabel("Качество фазового расчёта R")
+    ax.ticklabel_format(useOffset=False, style="plain", axis="y")
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"06_phase_quality_exp{EXPERIMENT_ID}.png")
+
+    # 07 Основная частота по файлам
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(result["file_id"], result["f0_Hz"] / 1000, marker="o", linewidth=2)
+    ax.set_xlabel("Номер файла")
+    ax.set_ylabel("Основная частота, кГц")
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"07_f0_vs_file_exp{EXPERIMENT_ID}.png")
+
+    # 08 RMS CH1 и CH2 по файлам
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(result["file_id"], result["voltage_rms_ac_V"], marker="o", linewidth=2, label="CH1")
+    ax.plot(result["file_id"], result["bio_rms_ac_V"], marker="o", linewidth=2, label="CH2")
+    ax.set_xlabel("Номер файла")
+    ax.set_ylabel("СКЗ AC-составляющей, В")
+    ax.legend()
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"08_ch1_ch2_rms_vs_file_exp{EXPERIMENT_ID}.png")
+
+    # 09 Остатки модели
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.axhline(0, linewidth=1)
+    ax.scatter(result["file_id"], result["residual_phase_model_C"], s=45)
+    ax.plot(result["file_id"], result["residual_phase_model_C"], linewidth=1)
+    ax.set_xlabel("Номер файла")
+    ax.set_ylabel("Остаток модели, °C")
+    style_axes(ax)
+    fig.tight_layout()
+    save_fig(fig, f"09_residuals_phase_model_exp{EXPERIMENT_ID}.png")
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    phase_corr = correlations.loc[correlations["feature"] == "phase_unwrapped_deg"].iloc[0]
+    ch3_rms_corr = correlations.loc[correlations["feature"] == "thermo_rms_ac_V"].iloc[0]
+    ch3_amp_corr = correlations.loc[correlations["feature"] == "thermo_amp_at_f0_V"].iloc[0]
+    model_row = model.iloc[0]
+
+    summary = f"""Experiment ID: {EXPERIMENT_ID}
+
+Количество обработанных точек: {len(result)}
+Количество ошибок обработки: {len(errors_df)}
+
+Температурная таблица:
+{MEASUREMENTS.to_string(index=False)}
+
+Основная частота:
+median f0 = {result['f0_Hz'].median():.3f} Hz
+mean f0   = {result['f0_Hz'].mean():.3f} Hz
+
+Корреляция температура — фазовый сдвиг:
+Pearson r  = {phase_corr['pearson_r']:.6f}
+Pearson p  = {phase_corr['pearson_p']:.6g}
+Spearman ρ = {phase_corr['spearman_rho']:.6f}
+Spearman p = {phase_corr['spearman_p']:.6g}
+
+Линейная модель температуры по фазе:
+T = {model_row['a_slope_C_per_deg']:.6f} * phase_deg + {model_row['b_intercept_C']:.6f}
+R²   = {model_row['r_squared']:.6f}
+RMSE = {model_row['rmse_C']:.6f} °C
+MAE  = {model_row['mae_C']:.6f} °C
+
+Корреляция температура — RMS AC CH3:
+Pearson r  = {ch3_rms_corr['pearson_r']:.6f}
+Pearson p  = {ch3_rms_corr['pearson_p']:.6g}
+Spearman ρ = {ch3_rms_corr['spearman_rho']:.6f}
+Spearman p = {ch3_rms_corr['spearman_p']:.6g}
+
+Корреляция температура — амплитуда CH3 на f0:
+Pearson r  = {ch3_amp_corr['pearson_r']:.6f}
+Pearson p  = {ch3_amp_corr['pearson_p']:.6g}
+Spearman ρ = {ch3_amp_corr['spearman_rho']:.6f}
+Spearman p = {ch3_amp_corr['spearman_p']:.6g}
+
+Флаги качества:
+{quality.to_string(index=False)}
+
+Ошибки:
+{errors_df.to_string(index=False) if len(errors_df) else "Ошибок нет."}
+"""
+
+    with open(OUT_DIR / f"summary_experiment_id_{EXPERIMENT_ID}.txt", "w", encoding="utf-8") as f:
+        f.write(summary)
+
+    print("\n" + "=" * 70)
+    print("ГОТОВО")
+    print("=" * 70)
+    print(summary)
+    print(f"\nРезультаты сохранены в папке:\n{OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
